@@ -1,4 +1,3 @@
-
 import os
 import json
 import requests
@@ -37,6 +36,9 @@ SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
 
 JOB_LISTINGS_URL = "https://www.remotefront.com/remote-jobs"
+
+# Cache for job descriptions to avoid redundant HTTP calls
+job_desc_cache = {}
 
 def get_with_retries(url, headers, timeout=TIMEOUT, retries=RETRIES):
     """Helper function to fetch a URL with retries."""
@@ -81,8 +83,9 @@ def fetch_job_listings():
     page_count = 0
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/115.0 Safari/537.36"
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/115.0 Safari/537.36")
     }
 
     while url and page_count < MAX_PAGES:
@@ -91,6 +94,7 @@ def fetch_job_listings():
         visited_urls.add(url)
         page_count += 1
 
+        logger.info(f"Fetching page {page_count}: {url}")
         response = get_with_retries(url, headers, timeout=TIMEOUT, retries=RETRIES)
         if not response:
             break
@@ -107,6 +111,7 @@ def fetch_job_listings():
             if not title_tag:
                 continue
             title = title_tag.get_text(strip=True)
+            logger.debug(f"Found job title: {title}")
 
             link_tag = title_tag.find("a")
             if link_tag and link_tag.has_attr("href"):
@@ -121,8 +126,10 @@ def fetch_job_listings():
                 "hour" in tag.get_text().lower() or 
                 "day" in tag.get_text().lower()))
             relative_time = time_tag.get_text(strip=True) if time_tag else ""
+            parsed_time = parse_relative_time(relative_time)
+            logger.debug(f"Job '{title}' relative time: '{relative_time}' parsed as {parsed_time}")
 
-            if parse_relative_time(relative_time) <= timedelta(days=1):
+            if parsed_time <= timedelta(days=1):
                 page_has_new_jobs = True
 
             listings.append({
@@ -144,42 +151,61 @@ def fetch_job_listings():
         else:
             break
 
+    logger.info(f"Total jobs fetched: {len(listings)}")
     return listings
 
 def fetch_job_description(job_url):
     """
     Fetches the job detail page and extracts the job description.
-    Uses retry logic and custom headers.
+    Uses retry logic, custom headers, and caches the result.
     """
+    if job_url in job_desc_cache:
+        return job_desc_cache[job_url]
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/115.0 Safari/537.36"
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/115.0 Safari/537.36")
     }
     response = get_with_retries(job_url, headers, timeout=TIMEOUT, retries=RETRIES)
     if not response:
-        return "Could not fetch job details."
+        job_desc_cache[job_url] = "Could not fetch job details."
+        return job_desc_cache[job_url]
     try:
         soup = BeautifulSoup(response.content, 'html.parser')
         description_div = soup.find("div", class_="job-description")
         if description_div:
-            return description_div.get_text(separator="\n", strip=True)
+            description = description_div.get_text(separator="\n", strip=True)
         else:
-            return soup.get_text(separator="\n", strip=True)
+            description = soup.get_text(separator="\n", strip=True)
+        job_desc_cache[job_url] = description
+        return description
     except Exception as e:
         logger.error(f"Error fetching job description from {job_url}: {e}")
-        return f"Error fetching job description: {e}"
+        job_desc_cache[job_url] = f"Error fetching job description: {e}"
+        return job_desc_cache[job_url]
 
 def filter_recent_jobs(listings, keyword=KEYWORD_FILTER):
     """
     Filters job listings to include only those posted within the last 24 hours
-    and whose title contains the given keyword (case-insensitive).
+    and whose title or job description contains the given keyword (case-insensitive).
     """
     recent_jobs = []
     for job in listings:
         rt_text = job.get("relative_time", "")
-        if parse_relative_time(rt_text) <= timedelta(days=1):
-            if keyword.lower() in job.get("title", "").lower():
+        parsed_time = parse_relative_time(rt_text)
+        if parsed_time <= timedelta(days=1):
+            title_lower = job.get("title", "").lower()
+            if keyword.lower() in title_lower:
                 recent_jobs.append(job)
+            else:
+                # Check the job description if not found in the title.
+                if job.get("detail_url"):
+                    description = fetch_job_description(job["detail_url"])
+                    if keyword.lower() in description.lower():
+                        job["description"] = description  # Cache in the job object.
+                        recent_jobs.append(job)
+    logger.info(f"Jobs after filtering by keyword '{keyword}': {len(recent_jobs)}")
     return recent_jobs
 
 def compose_email(jobs):
@@ -195,7 +221,11 @@ def compose_email(jobs):
             html += f"<h2>{job['title']}</h2>"
             if job.get("detail_url"):
                 html += f"<p>View Posting: <a href='{job['detail_url']}'>{job['detail_url']}</a></p>"
-                description = fetch_job_description(job["detail_url"])
+                # Use cached description if available.
+                if "description" in job:
+                    description = job["description"]
+                else:
+                    description = fetch_job_description(job["detail_url"])
                 html += f"<p>{description}</p>"
             html += "<hr/>"
     html += "</body></html>"
@@ -222,10 +252,13 @@ def send_email(subject, html_content):
         logger.error(f"Error sending email: {e}")
 
 def main():
-    listings = fetch_job_listings()
-    recent_jobs = filter_recent_jobs(listings, keyword=KEYWORD_FILTER)
-    email_body = compose_email(recent_jobs)
-    send_email("Daily RemoteFront Job Listings (Filtered)", email_body)
+    try:
+        listings = fetch_job_listings()
+        recent_jobs = filter_recent_jobs(listings, keyword=KEYWORD_FILTER)
+        email_body = compose_email(recent_jobs)
+        send_email("Daily RemoteFront Job Listings (Filtered)", email_body)
+    except Exception as e:
+        logger.error(f"An error occurred in main: {e}")
 
 if __name__ == "__main__":
     main()
