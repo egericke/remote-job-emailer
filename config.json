@@ -1,0 +1,6 @@
+{
+  "max_pages": 10,
+  "timeout": 10,
+  "retries": 3,
+  "keyword_filters": "improvement"
+}
