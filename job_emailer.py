@@ -30,7 +30,7 @@ def parse_relative_time(text):
     Parses a relative time string (e.g. "about 2 hours", "6 minutes")
     and returns a timedelta.
     """
-    match = re.search(r'(\d+)\s*(minute|hour|day)', text.lower())
+    match = re.search(r'(\d+)\s*(minutes?|hours?|days?)', text.lower())
     if match:
         num = int(match.group(1))
         unit = match.group(2)
@@ -40,55 +40,62 @@ def parse_relative_time(text):
             return timedelta(hours=num)
         elif "day" in unit:
             return timedelta(days=num)
-    return timedelta.max
+    return timedelta.max  # Fallback: skip if not parseable
 
 def fetch_job_listings():
-    """
-    Fetches the job listings from RemoteFront.
-    Returns a list of dictionaries with keys: 'title', 'detail_url', and 'relative_time'.
-    """
     listings = []
-    response = requests.get(JOB_LISTINGS_URL)
-    if response.status_code != 200:
-        print("Failed to fetch job listings.")
-        return listings
+    url = JOB_LISTINGS_URL  # Starting URL
+    while url:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"Failed to fetch {url}")
+            break
 
-    soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(response.content, 'html.parser')
+        # Try to select each job posting card.
+        job_cards = soup.find_all("div", class_="job-card")
+        if not job_cards:
+            # Fallback: try looking for <article> elements.
+            job_cards = soup.find_all("article")
 
-    # Try to select each job posting card.
-    job_cards = soup.find_all("div", class_="job-card")
-    if not job_cards:
-        # Fallback: try looking for <article> elements.
-        job_cards = soup.find_all("article")
+        for card in job_cards:
+            # Extract job title.
+            title_tag = card.find(["h2", "h3"])
+            if not title_tag:
+                continue
+            title = title_tag.get_text(strip=True)
 
-    for card in job_cards:
-        # Extract the job title (look for header tags like <h2> or <h3>).
-        title_tag = card.find(["h2", "h3"])
-        if not title_tag:
-            continue
-        title = title_tag.get_text(strip=True)
+            # Extract detail URL from an <a> tag within the title.
+            link_tag = title_tag.find("a")
+            if link_tag and link_tag.has_attr("href"):
+                detail_url = link_tag["href"]
+                if detail_url.startswith("/"):
+                    detail_url = "https://www.remotefront.com" + detail_url
+            else:
+                detail_url = None
 
-        # Extract the detail URL from an <a> tag within the title.
-        link_tag = title_tag.find("a")
-        if link_tag and link_tag.has_attr("href"):
-            detail_url = link_tag["href"]
-            if detail_url.startswith("/"):
-                detail_url = "https://www.remotefront.com" + detail_url
+            # Extract relative time (look for a <span> or <time> tag that contains "minute", "hour", or "day").
+            time_tag = card.find(lambda tag: tag.name in ["span", "time"] and (
+                "minute" in tag.get_text().lower() or 
+                "hour" in tag.get_text().lower() or 
+                "day" in tag.get_text().lower()))
+            relative_time = time_tag.get_text(strip=True) if time_tag else ""
+
+            listings.append({
+                "title": title,
+                "detail_url": detail_url,
+                "relative_time": relative_time
+            })
+
+        # Look for a "Next" button or link in the pagination section.
+        next_link = soup.find("a", string=lambda text: text and "next" in text.lower())
+        if next_link and next_link.has_attr("href"):
+            url = next_link["href"]
+            if url.startswith("/"):
+                url = "https://www.remotefront.com" + url
         else:
-            detail_url = None
+            url = None  # No more pages
 
-        # Look for an element that contains the relative time (e.g. "6 minutes", "2 hours")
-        time_tag = card.find(lambda tag: tag.name in ["span", "time"] and (
-            "minute" in tag.get_text().lower() or 
-            "hour" in tag.get_text().lower() or 
-            "day" in tag.get_text().lower()))
-        relative_time = time_tag.get_text(strip=True) if time_tag else ""
-
-        listings.append({
-            "title": title,
-            "detail_url": detail_url,
-            "relative_time": relative_time
-        })
     return listings
 
 def fetch_job_description(job_url):
@@ -118,6 +125,7 @@ def filter_recent_jobs(listings):
         if parse_relative_time(rt_text) <= timedelta(days=1):
             recent_jobs.append(job)
     return recent_jobs
+
 
 def compose_email(jobs):
     """
