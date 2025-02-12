@@ -1,4 +1,6 @@
+
 import os
+import json
 import requests
 from bs4 import BeautifulSoup
 from datetime import timedelta
@@ -6,10 +8,27 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import re
+import logging
 
-# =========================
-# Configuration – load from environment variables
-# =========================
+# Set up basic logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load configuration from config.json
+try:
+    with open("config.json", "r") as config_file:
+        config = json.load(config_file)
+except Exception as e:
+    logger.error(f"Could not load config.json: {e}")
+    config = {}
+
+# Configuration parameters with defaults
+MAX_PAGES = config.get("max_pages", 10)
+TIMEOUT = config.get("timeout", 10)
+RETRIES = config.get("retries", 3)
+KEYWORD_FILTER = config.get("keyword_filter", "improvement")
+
+# Load environment variables for SMTP credentials
 SMTP_SERVER = os.environ.get("SMTP_SERVER")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
 SMTP_USER = os.environ.get("SMTP_USER")
@@ -19,12 +38,20 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
 
 JOB_LISTINGS_URL = "https://www.remotefront.com/remote-jobs"
 
+def get_with_retries(url, headers, timeout=TIMEOUT, retries=RETRIES):
+    """Helper function to fetch a URL with retries."""
+    for attempt in range(1, retries + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            if response.status_code == 200:
+                return response
+            else:
+                logger.warning(f"Attempt {attempt}: Received status code {response.status_code} for {url}")
+        except Exception as e:
+            logger.warning(f"Attempt {attempt}: Exception fetching {url}: {e}")
+    logger.error(f"Failed to fetch {url} after {retries} attempts.")
+    return None
 
-JOB_LISTINGS_URL = "https://www.remotefront.com/remote-jobs"
-
-# =========================
-# Helper Functions
-# =========================
 def parse_relative_time(text):
     """
     Parses a relative time string (e.g. "about 2 hours", "6 minutes")
@@ -40,32 +67,47 @@ def parse_relative_time(text):
             return timedelta(hours=num)
         elif "day" in unit:
             return timedelta(days=num)
-    return timedelta.max  # Fallback: skip if not parseable
+    return timedelta.max  # Fallback if unable to parse
 
 def fetch_job_listings():
+    """
+    Fetches job listings from RemoteFront with pagination.
+    Limits pages to avoid infinite loops, stops if a page has no new jobs,
+    and uses custom headers and retry logic.
+    """
     listings = []
-    url = JOB_LISTINGS_URL  # Starting URL
-    while url:
-        response = requests.get(url)
-        if response.status_code != 200:
-            print(f"Failed to fetch {url}")
+    url = JOB_LISTINGS_URL
+    visited_urls = set()
+    page_count = 0
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/115.0 Safari/537.36"
+    }
+
+    while url and page_count < MAX_PAGES:
+        if url in visited_urls:
+            break  # Prevent revisiting the same page
+        visited_urls.add(url)
+        page_count += 1
+
+        response = get_with_retries(url, headers, timeout=TIMEOUT, retries=RETRIES)
+        if not response:
             break
 
         soup = BeautifulSoup(response.content, 'html.parser')
-        # Try to select each job posting card.
         job_cards = soup.find_all("div", class_="job-card")
         if not job_cards:
-            # Fallback: try looking for <article> elements.
             job_cards = soup.find_all("article")
 
+        page_has_new_jobs = False
+
         for card in job_cards:
-            # Extract job title.
             title_tag = card.find(["h2", "h3"])
             if not title_tag:
                 continue
             title = title_tag.get_text(strip=True)
 
-            # Extract detail URL from an <a> tag within the title.
             link_tag = title_tag.find("a")
             if link_tag and link_tag.has_attr("href"):
                 detail_url = link_tag["href"]
@@ -74,12 +116,14 @@ def fetch_job_listings():
             else:
                 detail_url = None
 
-            # Extract relative time (look for a <span> or <time> tag that contains "minute", "hour", or "day").
             time_tag = card.find(lambda tag: tag.name in ["span", "time"] and (
                 "minute" in tag.get_text().lower() or 
                 "hour" in tag.get_text().lower() or 
                 "day" in tag.get_text().lower()))
             relative_time = time_tag.get_text(strip=True) if time_tag else ""
+
+            if parse_relative_time(relative_time) <= timedelta(days=1):
+                page_has_new_jobs = True
 
             listings.append({
                 "title": title,
@@ -87,25 +131,34 @@ def fetch_job_listings():
                 "relative_time": relative_time
             })
 
-        # Look for a "Next" button or link in the pagination section.
+        if not page_has_new_jobs:
+            logger.info("No new jobs found on this page; stopping pagination.")
+            break
+
         next_link = soup.find("a", string=lambda text: text and "next" in text.lower())
         if next_link and next_link.has_attr("href"):
-            url = next_link["href"]
-            if url.startswith("/"):
-                url = "https://www.remotefront.com" + url
+            next_url = next_link["href"]
+            if next_url.startswith("/"):
+                next_url = "https://www.remotefront.com" + next_url
+            url = next_url
         else:
-            url = None  # No more pages
+            break
 
     return listings
 
 def fetch_job_description(job_url):
     """
     Fetches the job detail page and extracts the job description.
+    Uses retry logic and custom headers.
     """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/115.0 Safari/537.36"
+    }
+    response = get_with_retries(job_url, headers, timeout=TIMEOUT, retries=RETRIES)
+    if not response:
+        return "Could not fetch job details."
     try:
-        response = requests.get(job_url)
-        if response.status_code != 200:
-            return "Could not fetch job details."
         soup = BeautifulSoup(response.content, 'html.parser')
         description_div = soup.find("div", class_="job-description")
         if description_div:
@@ -113,28 +166,30 @@ def fetch_job_description(job_url):
         else:
             return soup.get_text(separator="\n", strip=True)
     except Exception as e:
+        logger.error(f"Error fetching job description from {job_url}: {e}")
         return f"Error fetching job description: {e}"
 
-def filter_recent_jobs(listings):
+def filter_recent_jobs(listings, keyword=KEYWORD_FILTER):
     """
-    Filters the job listings to only include those posted within the last 24 hours.
+    Filters job listings to include only those posted within the last 24 hours
+    and whose title contains the given keyword (case-insensitive).
     """
     recent_jobs = []
     for job in listings:
         rt_text = job.get("relative_time", "")
         if parse_relative_time(rt_text) <= timedelta(days=1):
-            recent_jobs.append(job)
+            if keyword.lower() in job.get("title", "").lower():
+                recent_jobs.append(job)
     return recent_jobs
-
 
 def compose_email(jobs):
     """
     Composes an HTML email with the job listings and their descriptions.
     """
     html = "<html><body>"
-    html += "<h1>RemoteFront Job Listings from the Past Day</h1>"
+    html += f"<h1>RemoteFront Job Listings (Filtered: '{KEYWORD_FILTER}') from the Past Day</h1>"
     if not jobs:
-        html += "<p>No new jobs were posted in the past day.</p>"
+        html += "<p>No new jobs matching the filter were posted in the past day.</p>"
     else:
         for job in jobs:
             html += f"<h2>{job['title']}</h2>"
@@ -157,23 +212,20 @@ def send_email(subject, html_content):
     msg.attach(MIMEText(html_content, "html"))
 
     try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=TIMEOUT)
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
         server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
         server.quit()
-        print("Email sent successfully.")
+        logger.info("Email sent successfully.")
     except Exception as e:
-        print(f"Error sending email: {e}")
+        logger.error(f"Error sending email: {e}")
 
-# =========================
-# Main Process
-# =========================
 def main():
     listings = fetch_job_listings()
-    recent_jobs = filter_recent_jobs(listings)
+    recent_jobs = filter_recent_jobs(listings, keyword=KEYWORD_FILTER)
     email_body = compose_email(recent_jobs)
-    send_email("Daily RemoteFront Job Listings", email_body)
+    send_email("Daily RemoteFront Job Listings (Filtered)", email_body)
 
 if __name__ == "__main__":
     main()
